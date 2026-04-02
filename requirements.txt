@@ -25,6 +25,9 @@ google-cloud-trace==1.18.0
 google-crc32c==1.8.0
 google-genai==1.68.0
 mcp==1.26.0
+pandas
+fastapi
+pydantic
 openai==2.14.0
 uvicorn==0.42.0
 
