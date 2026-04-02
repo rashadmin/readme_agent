@@ -36,7 +36,7 @@ logger = logging.getLogger("readme_agent_api")
 
 BASE_DIR = os.path.dirname(__file__)
 skill_path = os.path.join(BASE_DIR, "SKILL.md")
-content_path = os.path.join(BASE_DIR, "content_metadata.csv")
+content_path = os.path.join(BASE_DIR, "content_metadata.csv.zip")
 
 
 
