@@ -25,9 +25,7 @@ google-cloud-trace==1.18.0
 google-crc32c==1.8.0
 google-genai==1.68.0
 mcp==1.26.0
-numpy @ file:///home/task_176397996305634/conda-bld/numpy_and_numpy_base_1763980680623/work/dist/numpy-2.3.5-cp313-cp313-linux_x86_64.whl#sha256=78c581a960868ba31a535f8c54fa0be861dd2d9db1419e7218ace9db5377e772
 numpydoc @ file:///croot/numpydoc_1750958631691/work
 openai==2.14.0
-prompt_toolkit @ file:///home/task_176174483342131/conda-bld/prompt-toolkit_1761744881010/work
 uvicorn==0.42.0
 
