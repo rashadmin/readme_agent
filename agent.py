@@ -8,7 +8,7 @@ import pandas as pd
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
- 
+import time
 from google.adk.agents import Agent
 from google.adk.runners import Runner
 from google.adk.sessions import InMemorySessionService
@@ -18,7 +18,8 @@ from google.adk.tools.mcp_tool.mcp_session_manager import StreamableHTTPServerPa
 from google.genai import types as genai_types
 from dotenv import load_dotenv
 load_dotenv()
-#
+from fastapi.responses import StreamingResponse
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
@@ -125,22 +126,70 @@ def call_code_tool(files: list[str], repo: str) -> list[dict]:
         logger.exception("[TOOL] call_code_tool failed")
         return [{"error": str(e)}]
  
-def extract_repo_tool(repo: str) -> str: 
-    """ Fallback tool. Extracts the full codebase from GitHub using GitExtractor and returns trimmed structured summaries for every file. Only call this if get_summary_tool returned an empty list. Do NOT call this just because individual file summaries are vague — use call_code_tool for that. Args: repo: Repository name e.g. "my-project" Returns: A formatted string where each file block contains: - context: what the file does and its role - tools_or_frameworks_used: libraries and frameworks used - learning_resources: links to relevant official docs Treat this as your complete understanding of the codebase and skip directly to Step 3 — no need to call call_code_tool after this. """ 
-    logger.info(f"[TOOL] extract_repo_tool called | repo={repo}") 
-    try: 
-        extract = GitExtractor() 
-        extract.extract_files(repo) 
-        extract.group() 
-        summary = extract.generate() 
-        formatted = [] 
-        for filename, file_summary in summary.items(): 
-            formatted.append( f"File: {filename}\n" f"Purpose: {file_summary.get('context', '')}\n" f"Problem: {file_summary.get('problem', '')}\n" f"Tools: {file_summary.get('tools_or_frameworks_used', '')}\n" ) 
-            result = "\n".join(formatted) 
-            logger.info( f"[TOOL] extract_repo_tool returned formatted summary " f"for {len(summary)} files" ) 
-            return result 
-    except Exception as e: 
-        logger.exception("[TOOL] extract_repo_tool failed") 
+
+
+CACHE_DIR = os.path.join(BASE_DIR, "cache")
+os.makedirs(CACHE_DIR, exist_ok=True)
+
+CACHE_TTL_SECONDS = 60 * 60 * 24  # 24 hours
+
+
+def extract_repo_tool(repo: str) -> str:
+    """
+    Cached fallback tool using GitExtractor.
+    """
+
+    logger.info(f"[TOOL] extract_repo_tool called | repo={repo}")
+
+    cache_file = os.path.join(CACHE_DIR, f"{repo}.json")
+
+    try:
+        # ── Check cache ─────────────────────────────────────────────
+        if os.path.exists(cache_file):
+            age = time.time() - os.path.getmtime(cache_file)
+
+            if age < CACHE_TTL_SECONDS:
+                logger.info(f"[CACHE] HIT for repo={repo}")
+
+                with open(cache_file, "r") as f:
+                    cached = json.load(f)
+
+                return cached["result"]
+
+            else:
+                logger.info(f"[CACHE] STALE for repo={repo}")
+
+        # ── Cache miss → run extractor ──────────────────────────────
+        logger.info(f"[CACHE] MISS for repo={repo}")
+
+        from git import GitExtractor
+
+        extract = GitExtractor()
+        extract.extract_files(repo)
+        extract.group()
+        summary = extract.generate()
+
+        formatted = []
+        for filename, file_summary in summary.items():
+            formatted.append(
+                f"File: {filename}\n"
+                f"Purpose: {file_summary.get('context', '')}\n"
+                f"Problem: {file_summary.get('problem', '')}\n"
+                f"Tools: {file_summary.get('tools_or_frameworks_used', '')}\n"
+            )
+
+        result = "\n".join(formatted)
+
+        # ── Save cache ──────────────────────────────────────────────
+        with open(cache_file, "w") as f:
+            json.dump({"result": result, "timestamp": time.time()}, f)
+
+        logger.info(f"[CACHE] SAVED for repo={repo}")
+
+        return result
+
+    except Exception as e:
+        logger.exception("[TOOL] extract_repo_tool failed")
         return f"ERROR: GitExtractor failed — {str(e)}"
 
 
@@ -311,101 +360,197 @@ class ToolCallEvent(BaseModel):
     input: dict
     output: str | None = None
 
-async def run_agent_with_retry(repo, session_id, user_message):
-    last_exc = None
-    readme_pushed = False
+# ── SSE helper ────────────────────────────────────────────────────────────────
+import json
+def sse(data: dict) -> str:
+    return f"data: {json.dumps(data)}\n\n"
+ 
+ 
+# Human-readable labels for each tool shown in the frontend progress feed
+TOOL_LABELS = {
+    "get_summary_tool":      "Fetching file summaries offline",
+    "call_code_tool":        "Reading source files",
+    "extract_repo_tool":     "Fetching the file summaries online",
+    "get_file_contents":     "Checking existing README",
+    "create_or_update_file": "Pushing README to GitHub",
+}
 
-    for attempt in range(1, MCP_MAX_RETRIES + 1):
-        tool_calls: list[dict] = []
-        final_response = ""
-
-        try:
-            async for event in runner.run_async(
-                user_id=repo+'qe',
-                session_id=session_id,
-                new_message=user_message,
-            ):
-                if event.get_function_calls():
-                    for fn in event.get_function_calls():
-                        call_info = {"tool": fn.name, "input": fn.args}
-                        logger.info(f"[AGENT] Tool call: {call_info}")
-                        tool_calls.append(call_info)
-
-                if event.get_function_responses():
-                    for fn in event.get_function_responses():
-                        result_text = str(fn.response)[:500]
-                        if tool_calls:
-                            tool_calls[-1]["output"] = result_text
-                        logger.info(f"[AGENT] Tool result: {result_text[:200]}")
-
-                        # Detect successful README push
-                        if "create_or_update_file" in str(tool_calls[-1].get("tool", "")) and \
-                           "sha" in result_text and "isError" not in result_text:
-                            readme_pushed = True
-                            logger.info("[AGENT] README successfully pushed to GitHub")
-
-                if event.is_final_response():
-                    if event.content and event.content.parts:
-                        final_response = "".join(
-                            p.text for p in event.content.parts if hasattr(p, "text")
-                        )
-                    logger.info(f"[AGENT] Final response length: {len(final_response)}")
-
-            return tool_calls, final_response  # clean exit
-
-        except ConnectionError as exc:
-            last_exc = exc
-
-            # README was already pushed — don't retry, just return what we have
-            if readme_pushed:
-                logger.info("[AGENT] README was pushed successfully — ignoring post-push MCP timeout")
-                return tool_calls, final_response or "README successfully generated and pushed to GitHub."
-
-            wait = MCP_RETRY_DELAY * (2 ** (attempt - 1))
-            logger.warning(
-                f"[AGENT] MCP connection dropped on attempt {attempt}/{MCP_MAX_RETRIES} "
-                f"— retrying in {wait:.1f}s"
-            )
-            await asyncio.sleep(wait)
-
-        except Exception as exc:
-            logger.exception(f"[AGENT] Non-retryable error | repo={repo}")
-            raise
-
-    raise RuntimeError(f"Agent failed after {MCP_MAX_RETRIES} retries") from last_exc
-
-
-@app.post("/generate-readme")
-async def generate_readme(request: ChatRequest):
-    logger.info(f"[API] /generate-readme called | repo={request.repo}")
-
+ 
+async def stream_agent(repo: str):
+    """Async generator — runs the agent and yields SSE events in real time."""
+ 
+    yield sse({"type": "status", "message": "Agent starting..."})
+ 
     session = await session_service.create_session(
         app_name=APP_NAME,
-        user_id=request.repo+'qe',
+        user_id=repo,
     )
-
+ 
     user_message = genai_types.Content(
         role="user",
-        parts=[genai_types.Part(text=request.repo)],
+        parts=[genai_types.Part(text=repo)],
+    )
+ 
+    pending_tool: str | None = None
+ 
+    try:
+        async for event in runner.run_async(
+            user_id=repo,
+            session_id=session.id,
+            new_message=user_message,
+        ):
+            # Tool call fired by the agent
+            if event.get_function_calls():
+                for fn in event.get_function_calls():
+                    pending_tool = fn.name
+                    label = TOOL_LABELS.get(fn.name, fn.name)
+                    logger.info(f"[AGENT] Tool call: {fn.name} | args: {fn.args}")
+                    yield sse({
+                        "type":  "tool_start",
+                        "tool":  fn.name,
+                        "label": label,
+                        "input": fn.args,
+                    })
+ 
+            # Tool call returned a result
+            if event.get_function_responses():
+                for fn in event.get_function_responses():
+                    result_preview = str(fn.response)[:300]
+                    label = TOOL_LABELS.get(pending_tool or "", pending_tool or "")
+                    logger.info(f"[AGENT] Tool result: {result_preview[:200]}")
+                    yield sse({
+                        "type":   "tool_done",
+                        "tool":   pending_tool,
+                        "label":  label,
+                        "output": result_preview,
+                    })
+                    pending_tool = None
+ 
+            # Agent finished
+            if event.is_final_response():
+                final_text = ""
+                if event.content and event.content.parts:
+                    final_text = "".join(
+                        p.text for p in event.content.parts if hasattr(p, "text")
+                    )
+                logger.info(f"[AGENT] Final response length: {len(final_text)}")
+                yield sse({"type": "done", "response": final_text})
+ 
+    except Exception as e:
+        logger.exception(f"[AGENT] Error | repo={repo}")
+        yield sse({"type": "error", "message": str(e)})
+ 
+@app.get("/generate-readme")
+async def generate_readme(repo: str):
+    """
+    SSE endpoint. Streams agent progress events in real time.
+    Usage: GET /generate-readme?repo=my-repo
+    """
+    logger.info(f"[API] /generate-readme called | repo={repo}")
+    return StreamingResponse(
+        stream_agent(repo),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control":    "no-cache",
+            "X-Accel-Buffering": "no",  # prevents Nginx/Render from buffering the stream
+        },
     )
 
-    try:
-        tool_calls, final_response = await run_agent_with_retry(
-            repo=request.repo,
-            session_id=session.id,
-            user_message=user_message,
-        )
-    except RuntimeError as exc:
-        raise HTTPException(status_code=503, detail=str(exc))
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
+# async def run_agent_with_retry(repo, session_id, user_message):
+#     last_exc = None
+#     readme_pushed = False
 
-    return {
-        "status": "success",
-        "repo": request.repo,
-        "tool_calls": tool_calls,
-        "response": final_response,
-    }
+#     for attempt in range(1, MCP_MAX_RETRIES + 1):
+#         tool_calls: list[dict] = []
+#         final_response = ""
+
+#         try:
+#             async for event in runner.run_async(
+#                 user_id=repo+'qe',
+#                 session_id=session_id,
+#                 new_message=user_message,
+#             ):
+#                 if event.get_function_calls():
+#                     for fn in event.get_function_calls():
+#                         call_info = {"tool": fn.name, "input": fn.args}
+#                         logger.info(f"[AGENT] Tool call: {call_info}")
+#                         tool_calls.append(call_info)
+
+#                 if event.get_function_responses():
+#                     for fn in event.get_function_responses():
+#                         result_text = str(fn.response)[:500]
+#                         if tool_calls:
+#                             tool_calls[-1]["output"] = result_text
+#                         logger.info(f"[AGENT] Tool result: {result_text[:200]}")
+
+#                         # Detect successful README push
+#                         if "create_or_update_file" in str(tool_calls[-1].get("tool", "")) and \
+#                            "sha" in result_text and "isError" not in result_text:
+#                             readme_pushed = True
+#                             logger.info("[AGENT] README successfully pushed to GitHub")
+
+#                 if event.is_final_response():
+#                     if event.content and event.content.parts:
+#                         final_response = "".join(
+#                             p.text for p in event.content.parts if hasattr(p, "text")
+#                         )
+#                     logger.info(f"[AGENT] Final response length: {len(final_response)}")
+
+#             return tool_calls, final_response  # clean exit
+
+#         except ConnectionError as exc:
+#             last_exc = exc
+
+#             # README was already pushed — don't retry, just return what we have
+#             if readme_pushed:
+#                 logger.info("[AGENT] README was pushed successfully — ignoring post-push MCP timeout")
+#                 return tool_calls, final_response or "README successfully generated and pushed to GitHub."
+
+#             wait = MCP_RETRY_DELAY * (2 ** (attempt - 1))
+#             logger.warning(
+#                 f"[AGENT] MCP connection dropped on attempt {attempt}/{MCP_MAX_RETRIES} "
+#                 f"— retrying in {wait:.1f}s"
+#             )
+#             await asyncio.sleep(wait)
+
+#         except Exception as exc:
+#             logger.exception(f"[AGENT] Non-retryable error | repo={repo}")
+#             raise
+
+#     raise RuntimeError(f"Agent failed after {MCP_MAX_RETRIES} retries") from last_exc
+
+
+# @app.post("/generate-readme")
+# async def generate_readme(request: ChatRequest):
+#     logger.info(f"[API] /generate-readme called | repo={request.repo}")
+
+#     session = await session_service.create_session(
+#         app_name=APP_NAME,
+#         user_id=request.repo+'qe',
+#     )
+
+#     user_message = genai_types.Content(
+#         role="user",
+#         parts=[genai_types.Part(text=request.repo)],
+#     )
+
+#     try:
+#         tool_calls, final_response = await run_agent_with_retry(
+#             repo=request.repo,
+#             session_id=session.id,
+#             user_message=user_message,
+#         )
+#     except RuntimeError as exc:
+#         raise HTTPException(status_code=503, detail=str(exc))
+#     except Exception as exc:
+#         raise HTTPException(status_code=500, detail=str(exc))
+
+#     return {
+#         "status": "success",
+#         "repo": request.repo,
+#         "tool_calls": tool_calls,
+#         "response": final_response,
+#     }
  
 @app.get("/health")
 async def health():
